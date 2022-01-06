@@ -18,7 +18,10 @@ setup(
   install_requires=[
     'numpy',
     'pyarrow',
-    'Pillow', 
+    'Pillow',
+    'fire',
+    'img2dataset',
+    'scipy',
     'pandas',
     'torch>=1.6',
     'torchvision',
