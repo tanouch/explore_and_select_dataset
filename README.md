@@ -29,7 +29,7 @@ python explore_dataset_utils.py \
     --output_folder "/home/training_productGen_clip"
 
 
-4) Download your reduced dataset the img2dataset package from https://github.com/rom1504/img2dataset, as follows:
+3) Download your reduced dataset the img2dataset package from https://github.com/rom1504/img2dataset, as follows:
     
 img2dataset \
     --url_list=/home/training_productGen_clip \
