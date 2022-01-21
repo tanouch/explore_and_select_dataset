@@ -1,4 +1,5 @@
 import os, fire, fsspec, subprocess
+import json as js
 import torch, torchvision, clip
 import numpy as np
 import pandas as pd
@@ -8,6 +9,7 @@ import torch.nn.functional as F
 import pyarrow.parquet as pq
 from tqdm import tqdm
 from itertools import product
+from functools import reduce
 from scipy.special import softmax
 
 import webdataset as wds
@@ -59,8 +61,11 @@ def splitting_based_on_im_and_txt_similarity(im_embs, text_embs, ratio):
     return indexes
 
 
-def splitting_based_on_zero_shot_classification(model, embs, text_inputs, softmax_bool, ratio, \
-                                                positivity_constraints=None, plot=False):
+def splitting_based_on_zero_shot_classification(model, embs, text_inputs, softmax_bool, \
+                                                ratio, ratio_neg=0.5, \
+                                                positivity_constraints=None, plot=False, \
+                                                intersection=False):
+    
     text_features = torch.cat([clip.tokenize(f"{c}") for c in text_inputs]).cuda()
     with torch.no_grad():
         text_features = model.encode_text(text_features)
@@ -68,20 +73,33 @@ def splitting_based_on_zero_shot_classification(model, embs, text_inputs, softma
         text_features = text_features.detach().cpu().numpy()
     distances = measuring_similarity(embs, text_features, text_inputs)
     threshold_index = int(ratio*len(distances))
+    threshold_index_neg = int(ratio_neg*len(distances))
         
     if softmax_bool:
         distances = softmax(distances, axis=1)
         if plot:
             plot_histograms(distances[:,0], text_inputs[0])
-        return np.argpartition(-distances[:,0], threshold_index)[:threshold_index]
+        indexes = np.argpartition(-distances[:,0], threshold_index)[:threshold_index]
+        return indexes, None
+
     else:
-        indexes = np.arange(len(embs))
+        if intersection:
+            indexes = np.arange(len(embs))
+        else:
+            indexes = np.array(list())
+            
         for i in range(len(text_inputs)):
             if positivity_constraints[i]:
-                indexes = np.intersect1d(indexes, np.argpartition(-distances[:,i], threshold_index)[:threshold_index])
+                if intersection:
+                    indexes = np.intersect1d(indexes, np.argpartition(-distances[:,i], threshold_index)[:threshold_index])
+                else:
+                    indexes = np.union1d(indexes, np.argpartition(-distances[:,i], threshold_index)[:threshold_index])
             else:
-                indexes = np.setdiff1d(indexes, np.argpartition(-distances[:,i], threshold_index)[:threshold_index])
-        return indexes
+                indexes = np.setdiff1d(indexes, np.argpartition(-distances[:,i], threshold_index_neg)[:threshold_index_neg])
+                
+        #Get the distances only on the positive
+        index_distances = distances[indexes.astype(int)][:,0] 
+        return indexes, index_distances
 
 
 def splitting_based_on_clustering(index, centroids, threshold_index, num_clusters):
@@ -117,6 +135,10 @@ def save_parquet(fs, data, data_columns, output_path_metadata):
 def imagetransform(b):
     return Image.open(BytesIO(b))
 
+def jsontransform(j):
+    loss = js.loads(j)["loss"]
+    return loss
+    
 def tokenize(s):
     return s.decode('utf-8')#.replace("\n", "")
     #tokenizer.tokenize(s.decode('utf-8'), TEXT_SEQ_LEN, truncate_text=True).squeeze(0)
@@ -129,13 +151,13 @@ def custom_to_pil(x):
         x = x.convert("RGB")
     return x
 
-def stack_reconstructions(images, texts, title, num_rows, num_columns):
+def stack_reconstructions(images, texts, indexes, num_rows, num_columns, name, batch):
     w, h = images.shape[2], images.shape[3]
     img = Image.new("RGB", (num_columns*w, num_rows*h))
     for i in range(num_rows):
         for j in range(num_columns):
-            im = images[i*num_columns+j] 
-            txt = texts[i*num_columns+j]
+            im = images[indexes[i*num_columns+j]] 
+            txt = texts[indexes[i*num_columns+j]]
             im = custom_to_pil(im)
             draw = ImageDraw.Draw(im)
             font = ImageFont.truetype("arial.ttf", 16)
@@ -144,8 +166,9 @@ def stack_reconstructions(images, texts, title, num_rows, num_columns):
     plt.figure(figsize=(3*num_columns, 3*num_rows))
     plt.imshow(img, aspect='auto')
     plt.axis('off')
+    plt.savefig(name+str(batch))
     plt.show()
-
+    
 def create_your_dataloader(
     folder_images=None,
     dataset_size=None,
@@ -153,7 +176,7 @@ def create_your_dataloader(
     IMAGE_SIZE = 256,
     TEXT_SEQ_LEN = 77,
     RESIZE_RATIO = 0.75,
-    ):
+    plot_with_losses=True):
     
     assert folder_images is not None
     assert dataset_size is not None
@@ -167,22 +190,40 @@ def create_your_dataloader(
     ])    
 
     dataset = [str(p) for p in Path(folder_images).glob("**/*") if ".tar" in str(p).lower()][-1:]
-    myimg, mycap = "jpg", "txt"
-    image_text_mapping = {
-        myimg: imagetransform,
-        mycap: tokenize
-    }
-    image_mapping = {
-        myimg: imagepreproc
-    }
-
-    ds = (
-            wds.WebDataset(dataset)
-            .map_dict(**image_text_mapping)     
-            .map_dict(**image_mapping)
-            .to_tuple(mycap, myimg)
-            .batched(batch_size, partial=True) #avoid partial batches when using Distributed training
-        )
+    if plot_with_losses:
+        myloss, myimg, mycap = "json", "jpg", "txt"
+        image_text_mapping = {
+            myloss: jsontransform,
+            myimg: imagetransform,
+            mycap: tokenize
+        }
+        image_mapping = {
+            myimg: imagepreproc
+        }
+        ds = (
+                wds.WebDataset(dataset)
+                .map_dict(**image_text_mapping)     
+                .map_dict(**image_mapping)
+                .to_tuple(myloss, mycap, myimg)
+                .batched(batch_size, partial=True) #avoid partial batches when using Distributed training
+            )
+    else:
+        myimg, mycap = "jpg", "txt"
+        image_text_mapping = {
+            myimg: imagetransform,
+            mycap: tokenize
+        }
+        image_mapping = {
+            myimg: imagepreproc
+        }
+        ds = (
+                wds.WebDataset(dataset)
+                .map_dict(**image_text_mapping)     
+                .map_dict(**image_mapping)
+                .to_tuple(mycap, myimg)
+                .batched(batch_size, partial=True) #avoid partial batches when using Distributed training
+            )
+        
     dl = wds.WebLoader(ds, batch_size=None, shuffle=False, num_workers=4) # optionally add num_workers=2 (n) argument
     number_of_batches = dataset_size // (batch_size)
     dl = dl.slice(number_of_batches)
@@ -196,13 +237,17 @@ def get_sub_dataset(
     metadata_dir,
     strategies,
     output_folder,
-    ratio,
+    ratio=0.5,
+    ratio_constraints=0.5,
+    ratio_constraints_neg=0.5,
+    intersection=False,
     categories_prompt="",
-    positive_constraints_prompt="",
-    negative_constraints_prompt="",
+    positive_constraints_prompt=None,
+    negative_constraints_prompt=None,
     max_num_files_analysis = None,
     num_images_to_plot=None,
-    save_parquet_files=True
+    save_parquet_files=False,
+    add_losses=True
     ):
     
     assert im_dir is not None
@@ -228,12 +273,13 @@ def get_sub_dataset(
                 
     if "text_constraints" in strategies:
         pos_list, neg_list = list(), list()
-        if positive_constraints_prompt != "":
+        if positive_constraints_prompt:
             pos_list = [s.strip().replace("_", " ") for s in positive_constraints_prompt]
             print("Number of positive constraints", len(pos_list))
             print(pos_list)
             print("")
-        if negative_constraints_prompt != "":
+            
+        if negative_constraints_prompt:
             neg_list = [s.strip().replace("_", " ") for s in negative_constraints_prompt]
             print("Number of negative constraints", len(neg_list))
             print(neg_list)
@@ -259,25 +305,39 @@ def get_sub_dataset(
 
         if "text_categories" in strategies:
             indexes2 = splitting_based_on_zero_shot_classification(clip_model, txt_embs, categories_prompt, \
-                                                                  softmax_bool=True, ratio=ratio)
+                                                                   softmax_bool=True, \
+                                                                   ratio=ratio)
 
         if "text_constraints" in strategies:
-            indexes3 = splitting_based_on_zero_shot_classification(clip_model, im_embs, constraint_prompts, \
-                                                                   softmax_bool=False, ratio=ratio, \
+            indexes3, losses3 = splitting_based_on_zero_shot_classification(clip_model, im_embs, constraint_prompts, \
+                                                                   softmax_bool=False, \
+                                                                   ratio=ratio_constraints, ratio_neg=ratio_constraints_neg,\
+                                                                   intersection=intersection,\
                                                                    positivity_constraints=positivity_constraints)
 
-        indexes = np.array(list(set(indexes1).intersection(indexes2, indexes3)))
+        indexes = reduce(np.intersect1d, (indexes1, indexes2, indexes3))
+        indexes = indexes.astype(int)
         print("Ratio kept", len(indexes)/len(im_embs))
+        
+        #Add the loss to the metadata
+        submetadata = metadata[indexes]
+        if add_losses and "text_constraints" in strategies:
+            losses = losses3[np.where(np.in1d(indexes3, indexes))[0]]
+            submetadata = np.column_stack((submetadata, losses))
+            column_names.append("loss") 
+        
+        #Saving the parquet files if necessary
         if save_parquet_files:
             fs, _ = fsspec.core.url_to_fs(".")
-            save_parquet(fs, metadata[indexes], column_names, output_folder + "/" + "metadata_" + str(i) + ".parquet")
+            save_parquet(fs, submetadata, column_names, output_folder + "/" + "metadata_" + str(i) + ".parquet")
         i += 1
         if i>=max_num_files_analysis:
             break
     
+    #Returning metadata and column_names
     if num_images_to_plot is not None:
         sub_indexes = np.random.choice(len(indexes), size=num_images_to_plot, replace=False)
-        sub_metadata = metadata[indexes[sub_indexes]]
+        sub_metadata = submetadata[sub_indexes]
         return sub_metadata, column_names
     
     
@@ -289,34 +349,57 @@ def show_a_subset_of_selected_dataset(
     output_folder, \
     output_folder_images, \
     ratio, \
+    ratio_constraints, \
+    ratio_neg_constraints, \
     categories_prompt, \
     positive_constraints_prompt, \
     negative_constraints_prompt, \
+    intersection, \
     max_num_files_analysis, \
     num_images_to_plot, \
     batch_size, \
     num_rows, \
     num_columns, \
-    num_batches_to_show
+    num_batches_to_show, \
+    plot_with_losses
     ):
     
+    assert positive_constraints_prompt is not None
+    
     sub_metadata, column_names = get_sub_dataset(im_dir, txt_dir, metadata_dir, strategies, \
-                                                 output_folder, ratio, categories_prompt, \
+                                                 output_folder, ratio, ratio_constraints, ratio_neg_constraints, \
+                                                 intersection, categories_prompt, \
                                                  positive_constraints_prompt, negative_constraints_prompt, \
-                                                 max_num_files_analysis, num_images_to_plot)
+                                                 max_num_files_analysis, num_images_to_plot, False, plot_with_losses)
     fs, _ = fsspec.core.url_to_fs(".")
     save_parquet(fs, sub_metadata, column_names, output_folder + "/" + "metadata_0.parquet")
     
-    subprocess.run(['img2dataset', '--url_list', output_folder, \
-                     '--output_folder', output_folder_images, \
-                     '--thread_count', '64', '--image_size', '256', '--input_format', 'parquet', \
-                     '--output_format', 'webdataset', '--url_col', 'image_link', 
-                     '--caption_col', 'caption', '--processes_count', '15'])
+    if plot_with_losses:
+        subprocess.run(['img2dataset', '--url_list', output_folder, \
+                         '--output_folder', output_folder_images, \
+                         '--thread_count', '64', '--image_size', '256', '--input_format', 'parquet', \
+                         '--output_format', 'webdataset', '--url_col', 'image_link', 
+                         '--caption_col', 'caption', '--processes_count', '15', \
+                         '--save_additional_columns', '[loss]'])
+    else:
+        subprocess.run(['img2dataset', '--url_list', output_folder, \
+                         '--output_folder', output_folder_images, \
+                         '--thread_count', '64', '--image_size', '256', '--input_format', 'parquet', \
+                         '--output_format', 'webdataset', '--url_col', 'image_link', 
+                         '--caption_col', 'caption', '--processes_count', '15'])
+    
     dl = create_your_dataloader(folder_images=output_folder_images, dataset_size=num_images_to_plot, \
-                               batch_size=batch_size)
+                               batch_size=batch_size, plot_with_losses=plot_with_losses)
+    
     for i, batch in enumerate(dl):
-        (texts, images) = batch
-        stack_reconstructions(images, texts, title="test", num_rows=5, num_columns=7)
+        print("Batch", i)
+        if plot_with_losses:
+            (loss, texts, images) = batch
+            sorted_indexes = torch.argsort(torch.flatten(loss), descending=True).cpu().detach().numpy()
+            stack_reconstructions(images, texts, sorted_indexes, num_rows, num_columns, positive_constraints_prompt[0], i)
+        else:
+            (texts, images) = batch
+            stack_reconstructions(images, texts, np.arange(len(texts)), num_rows, num_columns, positive_constraints_prompt[0], i)
         if i>=num_batches_to_show:
             break
 
@@ -345,8 +428,22 @@ def create_interface_ipywidget():
 
     ratio_slider = widgets.FloatSlider(
              value=0.5,
-             description='Ratio:',
-             min=0.1,
+             description='Im-text Sim:',
+             min=0.05,
+             max=1,
+             step=0.05)
+    
+    ratio_constraints_slider = widgets.FloatSlider(
+             value=0.25,
+             description='Constraints:',
+             min=0.01,
+             max=1,
+             step=0.01)
+    
+    ratio_constraints_negative_slider = widgets.FloatSlider(
+             value=0.5,
+             description='Neg. constraints:',
+             min=0.05,
              max=1,
              step=0.05)
 
@@ -356,29 +453,51 @@ def create_interface_ipywidget():
         disabled=False,
         indent=False
     )
+    
     query_with_categories = widgets.Checkbox(
         value=False,
         description='Query with categories',
         disabled=False,
         indent=False
     )
+    
     query_with_text_constraints = widgets.Checkbox(
         value=False,
         description='Query with text constraints',
         disabled=False,
         indent=False
     )
+    
+    query_with_intersection = widgets.Checkbox(
+        value=False,
+        description='Do you query with intersection (else union)? ',
+        disabled=False,
+        indent=False
+    )
+    
+    plot_with_losses = widgets.Checkbox(
+        value=False,
+        description='Rank by the 1st text constraint similarity ?',
+        disabled=False,
+        indent=False
+    )
+    
+    
     button = widgets.Button(description='Show subset!')
     out = widgets.Output()
     return query_with_text_im_similarity, \
-          query_with_categories, \
-          query_with_text_constraints, \
-          categorie_constraints_with_prompt, \
-          positive_constraints_with_prompt, \
-          negative_constraints_with_prompt, \
-          ratio_slider, \
-          button, \
-          out            
+            query_with_categories, \
+            query_with_text_constraints, \
+            query_with_intersection, \
+            categorie_constraints_with_prompt, \
+            positive_constraints_with_prompt, \
+            negative_constraints_with_prompt, \
+            ratio_slider, \
+            ratio_constraints_slider, \
+            ratio_constraints_negative_slider, \
+            plot_with_losses, \
+            button, \
+            out
             
 if __name__ == "__main__":
     fire.Fire(get_sub_dataset)
