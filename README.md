@@ -13,6 +13,9 @@
     To get these, use https://github.com/rom1504/clip-retrieval
 
 ## Approach
+First, create your index using autofaiss (https://github.com/criteo/autofaiss). Run the following command:
+autofaiss build_index --embeddings="/home/u.tanielian/US/img_emb" --index_path="/home/u.tanielian/US/img_clip_knn_test.index" --index_infos_path="/home/u.tanielian/US/index_infos_test.json" --metric_type="ip" --save_on_disk True
+
 1) Explore your dataset with the notebook. 
 
 2) Then run the following command to select a reduced dataset.

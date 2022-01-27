@@ -11,6 +11,9 @@ from tqdm import tqdm
 from itertools import product
 from functools import reduce
 from scipy.special import softmax
+import faiss
+import math
+import glob
 
 import webdataset as wds
 from torchvision import transforms as T
@@ -58,13 +61,15 @@ def splitting_based_on_im_and_txt_similarity(im_embs, text_embs, ratio):
     threshold_index = int(ratio*len(distances))
     distances = np.reshape(distances, (-1,))
     indexes = np.argpartition(-distances, threshold_index)[:threshold_index]
-    return indexes
+    return indexes.astype(int)
 
 
-def splitting_based_on_zero_shot_classification(model, embs, text_inputs, softmax_bool, \
+def zero_shot_classification(model, embs, text_inputs, \
                                                 ratio, ratio_neg=0.5, \
-                                                positivity_constraints=None, plot=False, \
-                                                intersection=False):
+                                                positivity_constraints=None, \
+                                                plot=False, \
+                                                intersection=False, \
+                                                knn_index=None):
     
     text_features = torch.cat([clip.tokenize(f"{c}") for c in text_inputs]).cuda()
     with torch.no_grad():
@@ -74,40 +79,60 @@ def splitting_based_on_zero_shot_classification(model, embs, text_inputs, softma
     distances = measuring_similarity(embs, text_features, text_inputs)
     threshold_index = int(ratio*len(distances))
     threshold_index_neg = int(ratio_neg*len(distances))
-        
-    if softmax_bool:
-        distances = softmax(distances, axis=1)
-        if plot:
-            plot_histograms(distances[:,0], text_inputs[0])
-        indexes = np.argpartition(-distances[:,0], threshold_index)[:threshold_index]
-        return indexes, None
 
-    else:
-        if intersection:
-            indexes = np.arange(len(embs))
-        else:
-            indexes = np.array(list())
+    distances = softmax(distances, axis=1)
+    if plot:
+        plot_histograms(distances[:,0], text_inputs[0])
+    indexes = np.argpartition(-distances[:,0], threshold_index)[:threshold_index]
+    return indexes.astype(int), None
+
+
+def nearest_neighbors_constraints(model, embs, text_inputs, \
+                                  ratio, ratio_neg, \
+                                  positivity_constraints=None, \
+                                  plot=False, \
+                                  intersection=False, \
+                                  knn_index=None):
+    
+    text_features = torch.cat([clip.tokenize(f"{c}") for c in text_inputs]).cuda()
+    with torch.no_grad():
+        text_features = model.encode_text(text_features)
+        text_features /= text_features.norm(dim=-1, keepdim=True)
+        text_features = text_features.detach().cpu().numpy()
             
-        for i in range(len(text_inputs)):
-            if positivity_constraints[i]:
-                if intersection:
-                    indexes = np.intersect1d(indexes, np.argpartition(-distances[:,i], threshold_index)[:threshold_index])
-                else:
-                    indexes = np.union1d(indexes, np.argpartition(-distances[:,i], threshold_index)[:threshold_index])
+    if knn_index is None:
+        distances = measuring_similarity(embs, text_features, text_inputs)
+    else:
+        distances = np.zeros((len(embs), len(text_inputs)))
+
+    indexes = np.arange(len(embs)) if intersection else np.array(list())
+    for i in range(len(text_inputs)):
+        threshold = int(ratio*len(embs)) if positivity_constraints[i] else int(ratio_neg*len(embs))
+        if knn_index is None:
+            indexes_i = np.argpartition(-distances[:,i], threshold)[:threshold]
+        else:
+            if threshold >= 10000:
+                nprobe = math.ceil(threshold / 50)
+                params = faiss.ParameterSpace()
+                params.set_index_parameters(knn_index, f"nprobe={nprobe},efSearch={nprobe*5},ht={2048}")
+            query_vector = np.float32(np.reshape(text_features[i], (1, -1)))
+            if i==0:
+                distances_0, indexes_i = knn_index.search(query_vector, threshold)
+                distances[:,0][indexes_i.flatten()] = distances_0.flatten()
             else:
-                indexes = np.setdiff1d(indexes, np.argpartition(-distances[:,i], threshold_index_neg)[:threshold_index_neg])
-                
-        #Get the distances only on the positive
-        index_distances = distances[indexes.astype(int)][:,0] 
-        return indexes, index_distances
-
-
-def splitting_based_on_clustering(index, centroids, threshold_index, num_clusters):
-    indexes = {str(i): [] for i in range(num_clusters)}
-    distances, neighbors = index.search(centroids.astype(np.float32), threshold_index)
-    for i in range(num_clusters):
-        indexes[str(i)] = neighbors[i]
-    return indexes
+                _, indexes_i = knn_index.search(query_vector, threshold)
+            indexes_i = indexes_i.flatten().astype(int)
+        if positivity_constraints[i]:
+            if intersection:
+                indexes = np.intersect1d(indexes, indexes_i)
+            else:
+                indexes = np.union1d(indexes, indexes_i)
+        else:
+            indexes = np.setdiff1d(indexes, indexes_i)
+        
+    #Get the distances only on the 1st text constraint
+    index_distances = distances[indexes.astype(int)][:,0]
+    return indexes.astype(int), index_distances
 
 
 def load_embeddings(directory):
@@ -247,7 +272,9 @@ def get_sub_dataset(
     max_num_files_analysis = None,
     num_images_to_plot=None,
     save_parquet_files=False,
-    add_losses=True
+    plot_with_losses=True, 
+    use_autofaiss_index=False, 
+    index_knn_dir=None
     ):
     
     assert im_dir is not None
@@ -256,14 +283,38 @@ def get_sub_dataset(
     assert strategies is not None
     assert output_folder is not None
     os.makedirs(output_folder, exist_ok=True)
-
+    
+    #Load the KNN index
+    knn_index = None
+    if use_autofaiss_index:
+        assert index_knn_dir is not None
+        knn_index = faiss.read_index(glob.glob(index_knn_dir + "/*.index")[0])
+        
+    #Gather the data !
     im_files, txt_files, metadata_files = os.listdir(im_dir), os.listdir(txt_dir), os.listdir(metadata_dir)
-    im_files = sorted([im_dir+'/'+file for file in im_files if 'npy' in file])
-    txt_files = sorted([txt_dir+'/'+file for file in txt_files if 'npy' in file])
-    metadata_files = sorted([metadata_dir+'/'+file for file in metadata_files if 'parquet' in file])
+    im_files = [im_dir+'/'+file for file in im_files if 'npy' in file]
+    txt_files = [txt_dir+'/'+file for file in txt_files if 'npy' in file]
+    metadata_files = [metadata_dir+'/'+file for file in metadata_files if 'parquet' in file]
+    im_files.sort()
+    txt_files.sort()
+    metadata_files.sort()
     if max_num_files_analysis==None:
         max_num_files_analysis = len(im_files)
+        
+    #Load the data !
+    i = 0
+    im_embs, txt_embs, metadata = list(), list(), list()
+    for im_file, txt_file, metadata_file in tqdm(zip(im_files, txt_files, metadata_files)):
+        if i>=max_num_files_analysis:
+            break
+        im_embs.append(np.load(im_file))
+        txt_embs.append(np.load(txt_file))
+        metadata.append(pq.read_table(metadata_file).to_pandas())
+        assert len(im_embs) == len(txt_embs) == len(metadata)
+        i += 1
+    im_embs, txt_embs, metadata = np.concatenate(im_embs), np.concatenate(txt_embs), pd.concat(metadata)
     
+    #Define the strategies !
     if "text_categories" in strategies:
         if categories_prompt != "":
             categories_prompt = [s.strip().replace("_", " ") for s in categories_prompt]
@@ -289,50 +340,40 @@ def get_sub_dataset(
         
     if "text_categories" in strategies or "text_constraints" in strategies:
         clip_model, _ = clip.load("ViT-B/32", device=device, jit=False)
-    
-    i = 0
-    for im_file, txt_file, metadata_file in tqdm(zip(im_files, txt_files, metadata_files)):
-        im_embs = np.load(im_file)
-        txt_embs = np.load(txt_file)
-        metadata = pq.read_table(metadata_file).to_pandas()
-        assert len(im_embs) == len(txt_embs) == len(metadata)
-        column_names = list(metadata.columns)
-        metadata = metadata.to_numpy()
-        indexes1, indexes2, indexes3 = np.arange(len(im_embs)), np.arange(len(im_embs)), np.arange(len(im_embs))
-
-        if "image_vs_text_similarity" in strategies:
-            indexes1 = splitting_based_on_im_and_txt_similarity(im_embs, txt_embs, ratio)
-
-        if "text_categories" in strategies:
-            indexes2 = splitting_based_on_zero_shot_classification(clip_model, txt_embs, categories_prompt, \
-                                                                   softmax_bool=True, \
-                                                                   ratio=ratio)
-
-        if "text_constraints" in strategies:
-            indexes3, losses3 = splitting_based_on_zero_shot_classification(clip_model, im_embs, constraint_prompts, \
-                                                                   softmax_bool=False, \
-                                                                   ratio=ratio_constraints, ratio_neg=ratio_constraints_neg,\
-                                                                   intersection=intersection,\
-                                                                   positivity_constraints=positivity_constraints)
-
-        indexes = reduce(np.intersect1d, (indexes1, indexes2, indexes3))
-        indexes = indexes.astype(int)
-        print("Ratio kept", len(indexes)/len(im_embs))
         
-        #Add the loss to the metadata
-        submetadata = metadata[indexes]
-        if add_losses and "text_constraints" in strategies:
-            losses = losses3[np.where(np.in1d(indexes3, indexes))[0]]
-            submetadata = np.column_stack((submetadata, losses))
-            column_names.append("loss") 
-        
-        #Saving the parquet files if necessary
-        if save_parquet_files:
-            fs, _ = fsspec.core.url_to_fs(".")
-            save_parquet(fs, submetadata, column_names, output_folder + "/" + "metadata_" + str(i) + ".parquet")
-        i += 1
-        if i>=max_num_files_analysis:
-            break
+    #Sub-selecting the data !
+    column_names = list(metadata.columns)
+    metadata = metadata.to_numpy()
+    indexes1, indexes2, indexes3 = np.arange(len(im_embs)), np.arange(len(im_embs)), np.arange(len(im_embs))
+
+    if "image_vs_text_similarity" in strategies:
+        indexes1 = splitting_based_on_im_and_txt_similarity(im_embs, txt_embs, ratio)
+
+    if "text_categories" in strategies:
+        indexes2 = zero_shot_classification(clip_model, txt_embs, categories_prompt, ratio)
+
+    if "text_constraints" in strategies:
+        indexes3, losses3 = nearest_neighbors_constraints(clip_model, im_embs, constraint_prompts, \
+                                                          ratio=ratio_constraints, \
+                                                          positivity_constraints=positivity_constraints, \
+                                                          ratio_neg=ratio_constraints_neg,\
+                                                          intersection=intersection, \
+                                                          knn_index=knn_index)
+    indexes = reduce(np.intersect1d, (indexes1, indexes2, indexes3))
+    indexes = indexes.astype(int)
+    print("Ratio kept", np.round(len(indexes)/len(im_embs), 3))
+
+    #Add the loss to the metadata
+    submetadata = metadata[indexes]
+    if plot_with_losses and "text_constraints" in strategies:
+        losses = losses3[np.where(np.in1d(indexes3, indexes))[0]]
+        submetadata = np.column_stack((submetadata, losses))
+        column_names.append("loss") 
+
+    #Saving the parquet files if necessary
+    if save_parquet_files:
+        fs, _ = fsspec.core.url_to_fs(".")
+        save_parquet(fs, submetadata, column_names, output_folder + "/" + "metadata_" + str(i) + ".parquet")
     
     #Returning metadata and column_names
     if num_images_to_plot is not None:
@@ -361,16 +402,20 @@ def show_a_subset_of_selected_dataset(
     num_rows, \
     num_columns, \
     num_batches_to_show, \
-    plot_with_losses
+    plot_with_losses, \
+    use_autofaiss_index, 
+    index_knn_dir
     ):
     
     assert positive_constraints_prompt is not None
-    
+    save_parquet_files = False
     sub_metadata, column_names = get_sub_dataset(im_dir, txt_dir, metadata_dir, strategies, \
                                                  output_folder, ratio, ratio_constraints, ratio_neg_constraints, \
                                                  intersection, categories_prompt, \
                                                  positive_constraints_prompt, negative_constraints_prompt, \
-                                                 max_num_files_analysis, num_images_to_plot, False, plot_with_losses)
+                                                 max_num_files_analysis, num_images_to_plot, \
+                                                 save_parquet_files, plot_with_losses, \
+                                                 use_autofaiss_index, index_knn_dir)
     fs, _ = fsspec.core.url_to_fs(".")
     save_parquet(fs, sub_metadata, column_names, output_folder + "/" + "metadata_0.parquet")
     
@@ -396,6 +441,7 @@ def show_a_subset_of_selected_dataset(
         if plot_with_losses:
             (loss, texts, images) = batch
             sorted_indexes = torch.argsort(torch.flatten(loss), descending=True).cpu().detach().numpy()
+            #print(loss[sorted_indexes])
             stack_reconstructions(images, texts, sorted_indexes, num_rows, num_columns, positive_constraints_prompt[0], i)
         else:
             (texts, images) = batch
@@ -482,6 +528,13 @@ def create_interface_ipywidget():
         indent=False
     )
     
+    use_autofaiss_index = widgets.Checkbox(
+        value=False,
+        description='Use autofaiss index ?',
+        disabled=False,
+        indent=False
+    )
+    
     
     button = widgets.Button(description='Show subset!')
     out = widgets.Output()
@@ -496,6 +549,7 @@ def create_interface_ipywidget():
             ratio_constraints_slider, \
             ratio_constraints_negative_slider, \
             plot_with_losses, \
+            use_autofaiss_index, \
             button, \
             out
             
