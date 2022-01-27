@@ -47,3 +47,27 @@ img2dataset \
     --url_col image_link \
     --caption_col caption \
     --processes_count 15
+    
+
+# Other example with shoes
+python explore_dataset_utils.py \
+    --im_dir "/home/u.tanielian/US/img_emb" \
+    --txt_dir "/home/u.tanielian/US/text_emb" \
+    --metadata_dir "/home/u.tanielian/US/metadata" \
+    --strategies "text_constraints" \
+    --positive_constraints_prompt "shoes, classic_shoes, shoes_for_sports, running_shoes, shoes_and_sneakers" \
+    --ratio_constraints 0.10 \
+    --save_parquet_files true \
+    --intersection True \
+    --output_folder "/home/u.tanielian/training_clip_Shoes"
+##Length dataset 390764
+img2dataset \
+    --url_list=/home/u.tanielian/training_clip_Shoes \
+    --output_folder=/home/u.tanielian/training_productGen_Shoes \
+    --thread_count=64 \
+    --image_size=256 \
+    --input_format parquet \
+    --output_format webdataset \
+    --url_col image_link \
+    --caption_col caption \
+    --processes_count 15

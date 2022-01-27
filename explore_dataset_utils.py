@@ -191,7 +191,6 @@ def stack_reconstructions(images, texts, indexes, num_rows, num_columns, name, b
     plt.figure(figsize=(3*num_columns, 3*num_rows))
     plt.imshow(img, aspect='auto')
     plt.axis('off')
-    plt.savefig(name+str(batch))
     plt.show()
     
 def create_your_dataloader(
@@ -283,6 +282,7 @@ def get_sub_dataset(
     assert strategies is not None
     assert output_folder is not None
     os.makedirs(output_folder, exist_ok=True)
+    print("Intersection", intersection)
     
     #Load the KNN index
     knn_index = None
@@ -373,7 +373,8 @@ def get_sub_dataset(
     #Saving the parquet files if necessary
     if save_parquet_files:
         fs, _ = fsspec.core.url_to_fs(".")
-        save_parquet(fs, submetadata, column_names, output_folder + "/" + "metadata_" + str(i) + ".parquet")
+        print("Length dataset", len(submetadata))
+        save_parquet(fs, submetadata, column_names, output_folder + "/metadata_0.parquet")
     
     #Returning metadata and column_names
     if num_images_to_plot is not None:
